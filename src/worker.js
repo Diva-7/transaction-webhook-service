@@ -1,13 +1,15 @@
-require("dotenv").config();
 
-const mongoose = require("mongoose");
 const { Worker } = require("bullmq");
-const { connection } = require("./queue");
+const IORedis = require("ioredis");
 const Transaction = require("./models/Transaction");
 
-async function main() {
-  await mongoose.connect(process.env.MONGODB_URI);
-  console.log("Worker connected to MongoDB");
+async function startWorker() {
+  // The worker needs its own Redis connection.
+  const connection = new IORedis(process.env.REDIS_URL, {
+    maxRetriesPerRequest: null,
+  });
+
+  await connection.ping();
 
   const worker = new Worker(
     "transactions",
@@ -18,13 +20,15 @@ async function main() {
         transaction_id,
       });
 
+      // Do not process a transaction that is already complete.
       if (!transaction || transaction.status === "PROCESSED") {
         return;
       }
 
-      // Simulate an external payment processor taking 30 seconds.
+      // Simulate the external API taking 30 seconds.
       await new Promise((resolve) => setTimeout(resolve, 30_000));
 
+      // Update only if it has not already been processed.
       await Transaction.updateOne(
         {
           transaction_id,
@@ -38,7 +42,7 @@ async function main() {
         }
       );
 
-      console.log(`Processed transaction: ${transaction_id}`);
+      console.log(`Transaction ${transaction_id} processed`);
     },
     {
       connection,
@@ -47,25 +51,20 @@ async function main() {
   );
 
   worker.on("completed", (job) => {
-    console.log(`Job completed: ${job.id}`);
+    console.log(`Job ${job.id} completed`);
   });
 
   worker.on("failed", (job, error) => {
-    console.error(`Job failed: ${job?.id}`, error);
+    console.error(`Job ${job?.id} failed:`, error.message);
   });
 
-  async function shutdown() {
-    await worker.close();
-    await mongoose.disconnect();
-    await connection.quit();
-    process.exit(0);
-  }
+  worker.on("error", (error) => {
+    console.error("BullMQ worker error:", error.message);
+  });
 
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  console.log("BullMQ worker started in the API service");
+
+  return { worker, connection };
 }
 
-main().catch((error) => {
-  console.error("Worker startup failed:", error);
-  process.exit(1);
-});
+module.exports = { startWorker };

@@ -4,6 +4,7 @@ const express = require("express");
 const mongoose = require("mongoose");
 const Transaction = require("./models/Transaction");
 const { connection, transactionQueue } = require("./queue");
+const { startWorker } = require("./worker");
 
 const healthRoutes = require("./routes/health");
 const webhookRoutes = require("./routes/webhooks");
@@ -29,20 +30,65 @@ app.use((err, req, res, next) => {
   });
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3333;
+
+let workerRuntime;
 
 async function startServer() {
-  await mongoose.connect(process.env.MONGODB_URI);
-  await Transaction.init();
-  await connection.ping();
-  await transactionQueue.waitUntilReady();
+  try {
+    // Connect to MongoDB Atlas.
+    await mongoose.connect(process.env.MONGODB_URI);
+    console.log("Connected to MongoDB ->", process.env.MONGODB_URI);
 
-  app.listen(PORT, () => {
-    console.log(`API listening on http://localhost:${PORT}`);
-  });
+    // Ensure the Transaction model indexes are ready.
+    await Transaction.init();
+
+    // Verify the existing Redis connection and queue.
+    await connection.ping();
+    await transactionQueue.waitUntilReady();
+    console.log("Connected to Redis; transaction queue ready");
+
+    // Start the BullMQ worker in this same process.
+    workerRuntime = await startWorker();
+
+    // Start the Express API.
+    const server = app.listen(PORT, "0.0.0.0", () => {
+      console.log(`API listening on port ${PORT}`);
+    });
+
+    // Graceful shutdown.
+    async function shutdown(signal) {
+      console.log(`${signal} received; shutting down...`);
+
+      server.close();
+
+      try {
+        if (workerRuntime?.worker) {
+          await workerRuntime.worker.close();
+        }
+
+        if (workerRuntime?.connection) {
+          await workerRuntime.connection.quit();
+        }
+
+        await transactionQueue.close();
+        await connection.quit();
+        await mongoose.disconnect();
+
+        console.log("Shutdown complete");
+        process.exit(0);
+      } catch (error) {
+        console.error("Shutdown error:", error);
+        process.exit(1);
+      }
+    }
+
+    process.once("SIGTERM", () => shutdown("SIGTERM"));
+    process.once("SIGINT", () => shutdown("SIGINT"));
+  } catch (error) {
+    console.error("API startup failed:", error);
+    process.exit(1);
+  }
 }
 
-startServer().catch((error) => {
-  console.error("API startup failed:", error);
-  process.exit(1);
-});
+startServer();
